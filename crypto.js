@@ -1,6 +1,7 @@
 /**
  * AES-256-GCM Verschlüsselung mit Web Crypto API
- * Alles läuft lokal im Browser - keine Daten verlassen das Gerät.
+ * Daten werden client-seitig verschlüsselt und mit dem Server synchronisiert.
+ * Der Server sieht nur verschlüsselte Blobs - niemals Klartext.
  */
 
 const Crypto = (() => {
@@ -58,6 +59,15 @@ const Crypto = (() => {
     return btoa(String.fromCharCode(...new Uint8Array(bits)));
   }
 
+  // Generate a vault ID from password (used as server-side identifier)
+  async function getVaultId(password) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode('tresor-vault-id-' + password);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = new Uint8Array(hashBuffer);
+    return Array.from(hashArray).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
   // Encrypt data
   async function encrypt(data, key) {
     const encoder = new TextEncoder();
@@ -70,7 +80,6 @@ const Crypto = (() => {
       encoded
     );
 
-    // Combine IV + ciphertext
     const combined = new Uint8Array(iv.length + encrypted.byteLength);
     combined.set(iv);
     combined.set(new Uint8Array(encrypted), iv.length);
@@ -94,7 +103,32 @@ const Crypto = (() => {
     return JSON.parse(decoder.decode(decrypted));
   }
 
+  // Sync with server
+  async function syncToServer(vaultId, encryptedData) {
+    try {
+      await fetch('/api/vault/' + vaultId, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: encryptedData })
+      });
+    } catch (e) {
+      console.warn('Server-Sync fehlgeschlagen, Daten sind lokal gespeichert');
+    }
+  }
+
+  async function loadFromServer(vaultId) {
+    try {
+      const res = await fetch('/api/vault/' + vaultId);
+      const json = await res.json();
+      return json.data || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // Public API
+  let _vaultId = null;
+
   return {
     isFirstTime() {
       return !localStorage.getItem(HASH_KEY);
@@ -108,23 +142,47 @@ const Crypto = (() => {
       const hash = await hashPassword(password, salt);
       localStorage.setItem(HASH_KEY, hash);
 
+      _vaultId = await getVaultId(password);
+
       const key = await deriveKey(password, salt);
-      const emptyVault = await encrypt([], key);
-      localStorage.setItem(VAULT_KEY, emptyVault);
+
+      // Prüfe ob auf dem Server schon ein Tresor existiert (anderes Gerät)
+      const serverData = await loadFromServer(_vaultId);
+      if (serverData) {
+        localStorage.setItem(VAULT_KEY, serverData);
+      } else {
+        const emptyVault = await encrypt([], key);
+        localStorage.setItem(VAULT_KEY, emptyVault);
+        await syncToServer(_vaultId, emptyVault);
+      }
 
       return key;
     },
 
     async unlock(password) {
-      const saltStr = localStorage.getItem(SALT_KEY);
-      if (!saltStr) throw new Error('Kein Tresor gefunden');
+      _vaultId = await getVaultId(password);
 
+      // Wenn lokal kein Tresor existiert, vom Server laden
+      if (!localStorage.getItem(SALT_KEY)) {
+        const serverData = await loadFromServer(_vaultId);
+        if (!serverData) throw new Error('Kein Tresor gefunden');
+        // Server hat Daten aber wir brauchen auch Salt/Hash lokal
+        throw new Error('Bitte Tresor zuerst auf diesem Gerät erstellen');
+      }
+
+      const saltStr = localStorage.getItem(SALT_KEY);
       const salt = Uint8Array.from(atob(saltStr), c => c.charCodeAt(0));
       const hash = await hashPassword(password, salt);
       const storedHash = localStorage.getItem(HASH_KEY);
 
       if (hash !== storedHash) {
         throw new Error('Falsches Passwort');
+      }
+
+      // Server-Daten haben Vorrang (neueste Version)
+      const serverData = await loadFromServer(_vaultId);
+      if (serverData) {
+        localStorage.setItem(VAULT_KEY, serverData);
       }
 
       return deriveKey(password, salt);
@@ -139,6 +197,10 @@ const Crypto = (() => {
     async saveVault(entries, key) {
       const encrypted = await encrypt(entries, key);
       localStorage.setItem(VAULT_KEY, encrypted);
+      // Sync zum Server
+      if (_vaultId) {
+        await syncToServer(_vaultId, encrypted);
+      }
     }
   };
 })();
